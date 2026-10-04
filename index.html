@@ -993,6 +993,31 @@ function stampChangedDocs(){
   }
 }
 function save(localOnly){pullLatest(true);try{pruneTombstoned(state)}catch(e){}stampChangedDocs();state.updatedAt=Date.now();saveLocal();if(state.currentUser!=null)sessionStorage.setItem(SESSION_KEY,String(state.currentUser));else sessionStorage.removeItem(SESSION_KEY);if(!localOnly&&firebaseDb)scheduleCloudWrite();renderNav()}
+async function ensureAdminCloudReady(action){
+  if(firebaseDb&&firebaseReady)return true;
+  if(firebaseLoadPromise){try{await firebaseLoadPromise}catch(e){}}
+  if(firebaseDb&&firebaseReady)return true;
+  const why=firebaseLastError||((firebaseState==='connecting')?'Firestore abhi connect ho raha hai. Kuch seconds baad try karein.':'Firestore ready nahi hai. Admin → Database me connection check karein.');
+  toast((action||'Action')+' nahi kiya — '+why,'err');
+  return false
+}
+async function syncAdminChange(){
+  if(!firebaseDb||!firebaseReady)return{ok:false,error:firebaseLastError||'Firestore cloud abhi ready nahi hai.'};
+  if(cloudWriteTimer){clearTimeout(cloudWriteTimer);cloudWriteTimer=null}
+  const ok=await syncNow();
+  if(!ok)return{ok:false,error:firebaseLastError||'Firestore write confirm nahi hua.'};
+  let pending=0;try{pending=buildDiffOps().length}catch(e){}
+  if(pending){scheduleCloudWrite(0);return{ok:false,error:pending+' change(s) abhi cloud me pending hain.'}}
+  return{ok:true,error:''}
+}
+function reportAdminSync(action,result){
+  if(result&&result.ok){toast(action+' — Firestore me save confirm ho gaya');return}
+  const detail=String(result&&result.error||firebaseLastError||'unknown sync error').slice(0,180);
+  toast(action+' local browser par hai, lekin Firestore sync confirm nahi hua: '+detail+' • Admin → Database check karein.','err')
+}
+const adminWriteLocks=new Set();
+function beginAdminWrite(key){if(adminWriteLocks.has(key)){toast('Is action ka cloud save abhi chal raha hai','err');return false}adminWriteLocks.add(key);return true}
+function endAdminWrite(key){adminWriteLocks.delete(key)}
 /* saari collections ko in-memory 'state' me lo (UI code unchanged); naya project ho to defaults seed ho jaate hain */
 async function loadFirebase(){
   if(!firebaseDb){firebaseState='offline';firebaseLastError='Firebase SDK did not load';return false}
@@ -1057,23 +1082,57 @@ function applyChanges(key,changes){
     if(c.type==='removed'){const n=arr.filter(it=>String(it.id)!==id);if(n.length!==arr.length){state[key]=n;changed=true}addTombstone(key,id);delete _cloud[key][id]}
     else{const idx=arr.findIndex(it=>String(it.id)===id);
       if(idx>=0){
-        /* conflict guard: local doc cloud doc se NAYA hai (updatedAt) -> local rakho, wapas push hoga */
-        const lt=Number((arr[idx]&&arr[idx].updatedAt)||0),rt=Number((data&&data.updatedAt)||0);
-        const localJs=stableStringify(arr[idx]);
-        if(lt>rt){keepLocal=true}
-        else if(lt===rt&&localJs!==stableStringify(data)&&localJs!==stableStringify(_cloud[key][id]||null)){
-          /* dono bina stamp (legacy): local me pending change hai jo abhi sync nahi hua -> local rakho */
-          keepLocal=true;
+        const local=arr[idx],base=_cloud[key][id]||null;
+        const localJs=stableStringify(local),remoteJs=stableStringify(data),baseJs=base?stableStringify(base):null;
+        if(localJs===remoteJs){_cloud[key][id]=deepCopy(data)}
+        else if(!base){
+          /* No prior cloud version: cloud wins this first conflict. */
+          arr[idx]=data;_cloud[key][id]=deepCopy(data);changed=true
+        }else{
+          const localDirty=localJs!==baseJs,remoteDirty=remoteJs!==baseJs;
+          if(!localDirty){
+            /* Local copy was clean. Always accept Firestore, even if this device's clock is ahead. */
+            arr[idx]=data;_cloud[key][id]=deepCopy(data);changed=true
+          }else if(!remoteDirty){
+            /* Only this tab changed since its last cloud snapshot; keep and push it. */
+            keepLocal=true
+          }else if(key==='users'){
+            /* Field-level three-way merge: preserve unrelated local edits, but let the
+               cloud win conflicts on the same field (especially wallet balance). */
+            const merged=deepCopy(data),fields=new Set([...Object.keys(base),...Object.keys(local),...Object.keys(data)]);
+            fields.forEach(field=>{
+              const localChanged=stableStringify(local[field])!==stableStringify(base[field]);
+              const remoteChanged=stableStringify(data[field])!==stableStringify(base[field]);
+              if(localChanged&&!remoteChanged){
+                if(Object.prototype.hasOwnProperty.call(local,field))merged[field]=deepCopy(local[field]);
+                else delete merged[field]
+              }
+            });
+            if(stableStringify(local)!==stableStringify(merged)){arr[idx]=merged;changed=true}
+            _cloud[key][id]=deepCopy(data);
+            if(stableStringify(merged)!==remoteJs)keepLocal=true
+          }else{
+            /* For other simultaneous edits, use updatedAt only as a tie-breaker,
+               never as a reason to overwrite a clean, newer cloud snapshot. */
+            const lt=Number((local&&local.updatedAt)||0),rt=Number((data&&data.updatedAt)||0);
+            if(lt>rt)keepLocal=true;
+            else{arr[idx]=data;_cloud[key][id]=deepCopy(data);changed=true}
+          }
         }
-        else{if(localJs!==stableStringify(data)){arr[idx]=data;changed=true}_cloud[key][id]=data}
       }
-      else{arr.push(data);_cloud[key][id]=data;changed=true}}});
+      else{arr.push(data);_cloud[key][id]=deepCopy(data);changed=true}}});
   if(changed){saveLocal();scheduleRefresh()}
   if(keepLocal)scheduleCloudWrite();
 }
 function safeToAutoRender(){const r=route();const ae=document.activeElement;
   if(ae&&(ae.tagName==='INPUT'||ae.tagName==='TEXTAREA'||ae.tagName==='SELECT'||ae.isContentEditable))return false;
-  if(['order','funds','wallet','withdraw','transactions','profile','register','login'].includes(r))return false;
+  if(['order','profile','register','login'].includes(r))return false;
+  /* Wallet still receives real-time balance/status updates; only protect an in-progress form. */
+  if(['funds','wallet','withdraw','transactions'].includes(r)){
+    const dep=$('#fundForm'),wd=$('#wdForm');
+    if(dep&&(($('#proofData')&&$('#proofData').value)||($('#proofFile')&&$('#proofFile').value)||dep.querySelector('[name="amount"]')?.value||dep.querySelector('[name="ref"]')?.value))return false;
+    if(wd&&(['amount','detail','note'].some(k=>String(wd.querySelector('[name="'+k+'"]')?.value||'').trim())))return false;
+  }
   if(r==='admin'&&currentAdminTab==='blog')return false;return true}
 function refreshUI(){renderNav();if(!safeToAutoRender())return;const r=route();if(r==='admin'){adminTab(currentAdminTab)}else{routePage()}}
 function scheduleRefresh(){if(renderTimer)return;renderTimer=setTimeout(()=>{renderTimer=null;refreshUI()},300)}
@@ -1275,7 +1334,7 @@ function adminDatabase(){
   const connected=!!(firebaseReady&&firebaseDb&&firebaseState!=='error');
   const label=firebaseState==='error'?'SYNC ERROR':connected?'CONNECTED':String(firebaseState||'not checked').toUpperCase();
   const badgeClass=firebaseState==='error'?'bad':connected?'ok':'warn';
-  $('#adminBox').innerHTML=`<div class="adminCard"><div class="adminPanelHead"><div><h2>Live Database Check</h2><p class="muted small">Firestore status, read/write check aur pending data sync yahan verify karein.</p></div><span class="badge ${badgeClass}" id="dbStatus">${esc(label)}</span></div><div class="softBox"><b>Database:</b><p class="muted">Firebase Firestore • project configured in this file</p><p class="muted">Browser cache alag rahega; successful Firestore sync ke baad hi cloud update confirm hoga.</p>${firebaseLastError?`<div class="notice err"><b>Last error:</b> ${esc(firebaseLastError)}</div>`:''}<button class="btn" id="checkDatabaseBtn">☁️ Check &amp; Sync Database</button></div></div>`;
+  $('#adminBox').innerHTML=`<div class="adminCard"><div class="adminPanelHead"><div><h2>Live Database Check</h2><p class="muted small">Firestore status, read/write check aur pending data sync yahan verify karein.</p></div><span class="badge ${badgeClass}" id="dbStatus">${esc(label)}</span></div><div class="softBox"><b>Database:</b><p class="muted">Firebase Firestore • project configured in this file</p><p class="muted">Browser cache alag rahega; successful Firestore sync ke baad hi cloud update confirm hoga.</p><div class="notice warn"><b>Security:</b> Website ka custom login Firebase Auth nahi hai. Wallet/users ke liye Firebase Security Rules aur authenticated backend zaroori hain; client-side admin check Firestore ko secure nahi karta.</div>${firebaseLastError?`<div class="notice err"><b>Last error:</b> ${esc(firebaseLastError)}</div>`:''}<button class="btn" id="checkDatabaseBtn">☁️ Check &amp; Sync Database</button></div></div>`;
   $('#checkDatabaseBtn').onclick=checkDatabase
 }
 async function checkDatabase(){
@@ -1585,11 +1644,12 @@ function adminPage(){
 }
 function adminTab(t){currentAdminTab=t;if(t==='users')return adminUsers();if(t==='orders')return adminOrders();if(t==='funds')return adminFunds();if(t==='withdraw')return adminWithdrawals();if(t==='services')return adminServices();if(t==='blog')return adminBlog();if(t==='payment')return adminPayment();if(t==='database')return adminDatabase();if(t==='settings')return adminSettings()}
 function adminUsers(){
+  const walletMismatchCount=state.users.filter(u=>u.role!=='admin'&&Math.abs(walletIntegrity(u).diff)>0.01).length;
   let rows=state.users.filter(u=>u.role!=='admin').map(u=>{
     let w=walletOf(u),cnt=(state.orders||[]).filter(o=>String(o.userId)===String(u.id)).length;
-    return `<tr><td><b>${esc(u.name||'-')}</b><small>${esc(u.uid)} • ${esc(u.email||'')}${u.mobile?' • 📱 '+esc(u.mobile):''}</small><small class="muted">${cnt} orders • spent ${money(num(u.spent))}</small></td><td>${money(w.balance)}<small class="muted">Avail ${money(w.available)}${w.held>0?' • Hold '+money(w.held):''}</small><small class="muted">Ledger ${(()=>{const d=walletIntegrity(u).diff;return Math.abs(d)<0.01?'✓':'Δ '+money(d)})()}</small></td><td><span class="badge ${u.status==='active'?'ok':'bad'}">${esc(u.status)}</span></td><td><div class="adminActions"><input id="amt${u.id}" type="number" step="0.01" placeholder="Amount"><button class="btn small green" onclick="credit(${u.id})">Credit</button><button class="btn small ghost" onclick="debit(${u.id})">Debit</button><button class="btn small ghost" onclick="resetPass(${u.id})">Reset Pass</button><button class="btn small ${u.status==='active'?'red':'green'}" onclick="toggleUser(${u.id})">${u.status==='active'?'Suspend':'Activate'}</button><button class="btn small red" onclick="deleteUser(${u.id})">Delete</button></div></td></tr>`
+    return `<tr><td><b>${esc(u.name||'-')}</b><small>${esc(u.uid)} • ${esc(u.email||'')}${u.mobile?' • 📱 '+esc(u.mobile):''}</small><small class="muted">${cnt} orders • spent ${money(num(u.spent))}</small></td><td>${money(w.balance)}<small class="muted">Avail ${money(w.available)}${w.held>0?' • Hold '+money(w.held):''}</small><small class="muted">Ledger ${(()=>{const d=walletIntegrity(u).diff;return Math.abs(d)<0.01?'✓':'Δ '+money(d)})()}</small>${Math.abs(walletIntegrity(u).diff)>0.01?`<button class="btn small ghost" onclick="reconcileWallet(${u.id})">Reconcile ledger</button>`:''}</td><td><span class="badge ${u.status==='active'?'ok':'bad'}">${esc(u.status)}</span></td><td><div class="adminActions"><input id="amt${u.id}" type="number" step="0.01" placeholder="Amount"><button class="btn small green" onclick="credit(${u.id})">Credit</button><button class="btn small ghost" onclick="debit(${u.id})">Debit</button><button class="btn small ghost" onclick="resetPass(${u.id})">Reset Pass</button><button class="btn small ${u.status==='active'?'red':'green'}" onclick="toggleUser(${u.id})">${u.status==='active'?'Suspend':'Activate'}</button><button class="btn small red" onclick="deleteUser(${u.id})">Delete</button></div></td></tr>`
   }).join('');
-  $('#adminBox').innerHTML=`<div class="adminCard table"><div class="adminPanelHead"><div><h2>User Manager</h2><p class="muted small">Credit wallet, adjust balance, suspend or delete users. Debit kabhi bhi payout-hold amount ko nahi chhuta.</p></div><span class="badge ok">${state.users.filter(u=>u.role!=='admin').length} Users</span></div><table><thead><tr><th>User</th><th>Balance</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="4">No users yet</td></tr>'}</tbody></table></div>`
+  $('#adminBox').innerHTML=`<div class="adminCard table"><div class="adminPanelHead"><div><h2>User Manager</h2><p class="muted small">Credit wallet, adjust balance, suspend or delete users. Debit kabhi bhi payout-hold amount ko nahi chhuta.</p></div><span class="badge ok">${state.users.filter(u=>u.role!=='admin').length} Users</span></div>${walletMismatchCount?`<div class="notice err" style="margin:12px 0"><b>Wallet ledger mismatch:</b> ${walletMismatchCount} user wallet(s) ka balance transaction ledger se match nahi kar raha. Dobara credit karne se pehle Database tab me sync check karein; amount auto-adjust nahi kiya gaya.</div>`:''}<table><thead><tr><th>User</th><th>Balance</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows||'<tr><td colspan="4">No users yet</td></tr>'}</tbody></table></div>`
 }
 function adminOrders(){
   const STATUSES=['Pending','Processing','In progress','Completed','Partial','Canceled','Refunded','Failed'];
@@ -1649,6 +1709,22 @@ function exportPayoutCsv(){
     toast('CSV downloaded')
   }catch(e){console.error(e);toast('Export failed','err')}
 }
+function allocateServiceId(){
+  state.next=state.next||{};
+  const reserved=new Set();let highest=0;
+  const reserve=value=>{
+    if(value==null)return;
+    const key=String(value);reserved.add(key);
+    const n=Number(key);if(Number.isSafeInteger(n)&&n>highest)highest=n
+  };
+  (state.services||[]).forEach(s=>reserve(s&&s.id));
+  Object.keys((_cloud&&_cloud.services)||{}).forEach(reserve);
+  (((state.deleted||{}).services)||[]).forEach(reserve);
+  let id=Math.max(1,Math.floor(num(state.next.service,1)),highest+1);
+  while(reserved.has(String(id)))id++;
+  state.next.service=id+1;
+  return id
+}
 function adminServices(){
   let all=state.services||[];
   let q=String(sessionStorage.svq||'').toLowerCase(),cat=String(sessionStorage.svc||'All');
@@ -1659,17 +1735,26 @@ function adminServices(){
   <form class="formGrid" id="addSvc"><input name="cat" placeholder="Category" required><input name="name" placeholder="Service name" required><input name="rate" type="number" step="0.01" placeholder="Rate / 1000" required><input name="min" type="number" placeholder="Min" required><input name="max" type="number" placeholder="Max" required><button class="btn">Add Service</button></form></div>
   <div class="adminCard"><div class="adminActions" style="margin-bottom:12px"><div class="searchBar"><i class="fas fa-search"></i><input id="svSearch" placeholder="Search service or ID" value="${esc(q)}"></div><select id="svCat">${cats.map(c=>`<option ${cat===c?'selected':''}>${esc(c)}</option>`).join('')}</select></div>
   <div class="table"><table><thead><tr><th>ID</th><th>Cat</th><th>Name</th><th>Rate</th><th>Min</th><th>Max</th><th>Status</th><th>Action</th></tr></thead><tbody>${rows||`<tr><td colspan="8">${all.length?'No service matches this filter':'Catalogue is empty — add your own service above.'}</td></tr>`}</tbody></table></div></div>`;
-  $('#addSvc').onsubmit=e=>{
+  $('#addSvc').onsubmit=async e=>{
     e.preventDefault();
     let f=new FormData(e.target);
     let rate=round4(num(f.get('rate'))),mn=Math.max(1,num(f.get('min'),1)),mx=Math.max(1,num(f.get('max'),1));
-    if(!String(f.get('name')||'').trim())return toast('Service name required','err');
+    const name=String(f.get('name')||'').trim(),cat=String(f.get('cat')||'Other').trim()||'Other';
+    if(!name)return toast('Service name required','err');
     if(!(rate>0))return toast('Rate 0 se zyada hona chahiye','err');
     if(mx<mn)return toast('Max, Min se chhota nahi ho sakta','err');
-    /* id collision guard: default catalogue me chhote ids (5,6,7...) maujood hain, isliye next.service ko max id se upar rakho */
-    const maxId=(state.services||[]).reduce((a,s)=>Math.max(a,num(s.id)),0);if(state.next.service<=maxId)state.next.service=maxId+1;
-    state.services.push({id:state.next.service++,cat:String(f.get('cat')||'Other').trim(),name:String(f.get('name')).trim(),rate:rate,min:mn,max:mx,active:true});
-    save();toast('Service added');adminServices()
+    const lock='service-add';if(!beginAdminWrite(lock))return;
+    try{
+      if(!await ensureAdminCloudReady('Service add'))return;
+      if(!requireAdmin())return;
+      const id=allocateServiceId();
+      state.services.push({id,cat,name,rate,min:mn,max:mx,active:true});
+      save();
+      const result=await syncAdminChange();
+      reportAdminSync('Service #'+id+' added',result);
+      sessionStorage.removeItem('svq');sessionStorage.removeItem('svc');
+      adminServices()
+    }finally{endAdminWrite(lock)}
   };
   let si=$('#svSearch');if(si)si.oninput=()=>{sessionStorage.svq=si.value.trim().toLowerCase();if(!si.value)sessionStorage.removeItem('svq');clearTimeout(window.__svT);window.__svT=setTimeout(()=>adminServices(),300)};
   let sc=$('#svCat');if(sc)sc.onchange=()=>{sessionStorage.svc=sc.value==='All'?'':sc.value;adminServices()}
@@ -1731,12 +1816,15 @@ window.cancelMyOrder=id=>{
   dashboard()
 };
 /* ---------- admin: deposits ---------- */
-window.fundAct=(id,st)=>{
+window.fundAct=async(id,st)=>{
+  if(!requireAdmin())return;
+  if(!await ensureAdminCloudReady('Fund approval'))return;
   if(!requireAdmin())return;
   let f=(state.funds||[]).find(x=>String(x.id)===String(id));
   if(!f)return toast('Fund request not found (dusre tab se delete ho gayi?)','err');
   if(f.status!=='Pending')return toast('Ye request pehle se '+f.status+' hai','err');
   let u=state.users.find(x=>String(x.id)===String(f.userId));
+  let notice=null,label='Fund request updated';
   if(st==='Approved'){
     if(!u)return toast('User delete ho chuka hai — is request ko Reject karke close karein','err');
     let amt=round4(Math.max(0,num(f.amount)));
@@ -1744,15 +1832,19 @@ window.fundAct=(id,st)=>{
     f.status='Approved';f.reviewedAt=now();f.reviewedBy=(me()||{}).uid||'admin';
     u.balance=round4(Math.max(0,num(u.balance)+amt));
     pushTxn(u.id,'Credit',amt,'Deposit #'+f.id+' approved'+(f.ref?' • UTR '+f.ref:''));
-    save();toast(money(amt)+' balance me add ho gaya');
-    adminNotify('fundApproved',{username:f.user||u.uid,amount:amt,ref:f.ref,balance:walletOf(u).balance})
+    notice=()=>adminNotify('fundApproved',{username:f.user||u.uid,amount:amt,ref:f.ref,balance:walletOf(u).balance});
+    label=money(amt)+' user wallet me credit';
   }else{
     let why=prompt('Reject reason (user ko request me dikhega):','UTR / amount match nahi hua');
     if(why===null)return;
     f.status='Rejected';f.adminNote=String(why||'').trim().slice(0,200);f.reviewedAt=now();f.reviewedBy=(me()||{}).uid||'admin';
-    save();toast('Request rejected');
-    adminNotify('fundRejected',{username:f.user||'-',amount:num(f.amount),ref:f.ref,note:f.adminNote})
+    notice=()=>adminNotify('fundRejected',{username:f.user||'-',amount:num(f.amount),ref:f.ref,note:f.adminNote});
+    label='Fund request rejected';
   }
+  save();
+  const result=await syncAdminChange();
+  reportAdminSync(label,result);
+  if(result.ok&&notice)notice();
   adminFunds()
 };
 window.deleteFund=id=>{
@@ -1859,16 +1951,44 @@ window.deleteOrder=id=>{
   save();toast('Order deleted');adminOrders()
 };
 /* ---------- admin: wallet adjustments ---------- */
-window.credit=id=>{
+window.credit=async id=>{
   if(!requireAdmin())return;
-  let u=state.users.find(x=>String(x.id)===String(id));if(!u)return toast('User not found','err');
-  let inp=$('#amt'+id),a=round4(Math.max(0,num(inp&&inp.value)));
-  if(a<=0)return toast('Enter an amount greater than 0','err');
-  if(a>1000000)return toast('Ek click me max '+money(1000000),'err');
-  u.balance=round4(Math.max(0,num(u.balance)+a));
-  pushTxn(u.id,'Credit',a,'Admin credit');
-  if(inp)inp.value='';
-  save();toast(money(a)+' credited to '+u.uid);adminUsers()
+  const lock='credit:'+String(id);if(!beginAdminWrite(lock))return;
+  try{
+    const inp=$('#amt'+id),a=round4(Math.max(0,num(inp&&inp.value)));
+    if(a<=0)return toast('Enter an amount greater than 0','err');
+    if(a>1000000)return toast('Ek click me max '+money(1000000),'err');
+    if(!await ensureAdminCloudReady('Wallet credit'))return;
+    if(!requireAdmin())return;
+    let u=state.users.find(x=>String(x.id)===String(id));if(!u)return toast('User not found','err');
+    u.balance=round4(Math.max(0,num(u.balance)+a));
+    pushTxn(u.id,'Credit',a,'Admin credit');
+    const currentInput=$('#amt'+id);if(currentInput)currentInput.value='';
+    save();
+    const result=await syncAdminChange();
+    reportAdminSync(money(a)+' '+u.uid+' ko credit',result);
+    adminUsers()
+  }finally{endAdminWrite(lock)}
+};
+window.reconcileWallet=async id=>{
+  if(!requireAdmin())return;
+  const lock='wallet-reconcile:'+String(id);if(!beginAdminWrite(lock))return;
+  try{
+    if(!await ensureAdminCloudReady('Wallet reconciliation'))return;
+    if(!requireAdmin())return;
+    const u=state.users.find(x=>String(x.id)===String(id));if(!u)return toast('User not found','err');
+    const w=walletOf(u),ledger=round4(ledgerSum(u.id));
+    if(ledger<0||ledger+0.005<w.held)return toast('Ledger total payout hold se kam hai — manual audit zaroori hai','err');
+    const target=round4(ledger-w.held),delta=round4(target-w.available);
+    if(Math.abs(delta)<0.01)return toast('Wallet pehle se ledger ke saath match karta hai');
+    if(!confirm('Wallet ledger mismatch fix karein?\n\nCurrent wallet: '+money(w.balance)+'\nTransaction ledger: '+money(ledger)+'\nNew wallet total: '+money(ledger)+'\n\nIs user ke balance ko ledger ke hisaab se set kiya jayega.'))return;
+    u.balance=target;
+    pushTxn(u.id,'Reconcile',0,'Admin reconciled wallet balance to transaction ledger');
+    save();
+    const result=await syncAdminChange();
+    reportAdminSync('Wallet ledger reconciled for '+u.uid,result);
+    adminUsers()
+  }finally{endAdminWrite(lock)}
 };
 window.debit=id=>{
   if(!requireAdmin())return;
@@ -1915,30 +2035,55 @@ window.deleteUser=id=>{
   adminPage()
 };
 /* ---------- admin: services ---------- */
-window.saveSvc=id=>{
+window.saveSvc=async id=>{
   if(!requireAdmin())return;
-  let s=(state.services||[]).find(x=>String(x.id)===String(id));if(!s)return toast('Service not found','err');
-  let rate=round4(num(($('#rate'+id)||{}).value,-1)),mn=Math.max(1,num(($('#min'+id)||{}).value,s.min)),mx=Math.max(mn,num(($('#max'+id)||{}).value,s.max));
-  if(!(rate>=0))return toast('Rate 0 ya usse zyada ho','err');
-  if(mx<mn)return toast('Max, Min se chhota nahi ho sakta','err');
-  s.rate=rate;s.min=mn;s.max=mx;
-  save();toast('Service #'+id+' updated');adminServices()
+  const lock='service-update:'+String(id);if(!beginAdminWrite(lock))return;
+  try{
+    const rate=round4(num(($('#rate'+id)||{}).value,-1)),mn=Math.max(1,num(($('#min'+id)||{}).value,1)),mx=Math.max(1,num(($('#max'+id)||{}).value,1));
+    if(!(rate>=0))return toast('Rate 0 ya usse zyada ho','err');
+    if(mx<mn)return toast('Max, Min se chhota nahi ho sakta','err');
+    if(!await ensureAdminCloudReady('Service update'))return;
+    if(!requireAdmin())return;
+    let s=(state.services||[]).find(x=>String(x.id)===String(id));if(!s)return toast('Service not found','err');
+    s.rate=rate;s.min=mn;s.max=mx;
+    save();
+    const result=await syncAdminChange();
+    reportAdminSync('Service #'+id+' updated',result);
+    adminServices()
+  }finally{endAdminWrite(lock)}
 };
 window.saveRate=id=>window.saveSvc(id);
-window.toggleSvc=id=>{
+window.toggleSvc=async id=>{
   if(!requireAdmin())return;
-  let s=(state.services||[]).find(x=>String(x.id)===String(id));if(!s)return toast('Service not found','err');
-  s.active=s.active===false;
-  save();toast(s.active?'Service enabled':'Service disabled (catalogue me safe rahega)');adminServices()
+  const lock='service-toggle:'+String(id);if(!beginAdminWrite(lock))return;
+  try{
+    if(!await ensureAdminCloudReady('Service status change'))return;
+    if(!requireAdmin())return;
+    let s=(state.services||[]).find(x=>String(x.id)===String(id));if(!s)return toast('Service not found','err');
+    s.active=s.active===false;
+    save();
+    const result=await syncAdminChange();
+    reportAdminSync(s.active?'Service enabled':'Service disabled',result);
+    adminServices()
+  }finally{endAdminWrite(lock)}
 };
-window.deleteSvc=id=>{
+window.deleteSvc=async id=>{
   if(!requireAdmin())return;
-  let sv=(state.services||[]).find(x=>String(x.id)===String(id));if(!sv)return toast('Service not found','err');
-  let used=(state.orders||[]).filter(o=>String(o.serviceId||'')===String(id)||String(o.service||'')===String(sv.name)).length;
-  if(!confirm('Delete service: '+sv.name+' ('+money(num(sv.rate))+'/1000)?'+(used?'\n\nIs service ke '+used+' purane orders history me bane rahenge.':'')+'\n\nDevice + cloud (Firebase) dono se delete ho jayegi aur dobara wapas NAHI aayegi.'))return;
-  dropRecords('services',[String(id)]);
-  save();toast('Service deleted permanently');adminServices()
+  const lock='service-delete:'+String(id);if(!beginAdminWrite(lock))return;
+  try{
+    if(!await ensureAdminCloudReady('Service delete'))return;
+    if(!requireAdmin())return;
+    let sv=(state.services||[]).find(x=>String(x.id)===String(id));if(!sv)return toast('Service not found','err');
+    let used=(state.orders||[]).filter(o=>String(o.serviceId||'')===String(id)||String(o.service||'')===String(sv.name)).length;
+    if(!confirm('Delete service: '+sv.name+' ('+money(num(sv.rate))+'/1000)?'+(used?'\n\nIs service ke '+used+' purane orders history me bane rahenge.':'')+'\n\nDevice + cloud (Firebase) dono se delete ho jayegi aur dobara wapas NAHI aayegi.'))return;
+    dropRecords('services',[String(id)]);
+    save();
+    const result=await syncAdminChange();
+    reportAdminSync('Service deleted permanently',result);
+    adminServices()
+  }finally{endAdminWrite(lock)}
 };
+
 /* ---------- blog delete (ab permanently) ---------- */
 window.blogDelete=id=>{
   if(!requireAdmin())return;
@@ -2103,5 +2248,5 @@ window.addEventListener('pagehide',()=>{if(cloudWriteTimer){clearTimeout(cloudWr
 })();
 
 </script>
-<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a4515955eaf6a80c',t:'MTc5MTA4NzE1Mw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</body>
 </html>
